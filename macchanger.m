@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/sockio.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -36,6 +37,16 @@
 
 #define PERROR() fprintf(stderr, ERROR "%s: %s\n", __FUNCTION__, strerror(errno));
 
+#ifndef CONFIG_PATH
+#define CONFIG_PATH "/usr/local/etc/macchanger.conf"
+#endif
+
+#define LAUNCHD_LABEL "com.github.macchanger"
+#define LAUNCHD_PLIST_PATH "/Library/LaunchDaemons/" LAUNCHD_LABEL ".plist"
+
+#define MAX_RETRIES 6
+#define RETRY_DELAY_SECONDS 5
+
 typedef io_service_t interface_t;
 void interface_open(interface_t* iface, const char* name);
 void interface_get_name(interface_t iface, char* name);
@@ -54,6 +65,11 @@ void random_ether(ether_addr_t* ether);
 int ether_parse(const char* str, ether_addr_t* ether);
 const char* ether_to_string(const ether_addr_t* ether);
 
+void save_config(const char* config_path, const char* if_name, const ether_addr_t* ether);
+int load_config(const char* config_path, char* if_name, ether_addr_t* ether);
+int install_daemon(const char* bin_path);
+int uninstall_daemon(void);
+
 int main(int argc, char** argv) {
     static const struct option long_options[] = {
         {"random", no_argument, NULL, 'r'},
@@ -61,21 +77,27 @@ int main(int argc, char** argv) {
         {"permanent", no_argument, NULL, 'p'},
         {"show", no_argument, NULL, 's'},
         {"version", no_argument, NULL, 'v'},
+        {"save", no_argument, NULL, 'S'},
+        {"config", no_argument, NULL, 'c'},
+        {"install-daemon", no_argument, NULL, 'i'},
+        {"uninstall-daemon", no_argument, NULL, 'u'},
         {NULL, 0, NULL, 0}
     };
 
     char selected_option = 0;
+    char mac_specified = 0;
     ether_addr_t ether;
 
     int ch;
-    while ((ch = getopt_long(argc, argv, "rm:psv", long_options, NULL)) != -1) {
-        if(selected_option != 0) {
+    while ((ch = getopt_long(argc, argv, "rm:psvSciu", long_options, NULL)) != -1) {
+        if(selected_option != 0 && !(selected_option == 'S' && ch == 'm') && !(selected_option == 'm' && ch == 'S')) {
             fputs(ERROR "Only one option is allowed at a time\n", stderr);
             return 1;
         }
         selected_option = ch;
 
         if(ch == 'm') {
+            mac_specified = 1;
             int res = ether_parse(optarg, &ether);
             if(res) {
                 fputs(ERROR "Failed to parse MAC address\n", stderr);
@@ -86,11 +108,6 @@ int main(int argc, char** argv) {
     argc -= optind;
     argv += optind;
 
-    if(argc > 1) {
-        fputs(ERROR "Too many arguments\n", stderr);
-        return 1;
-    }
-
     if(selected_option == 0 || selected_option == '?') {
         print_usage();
         return opterr;
@@ -99,6 +116,90 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Handle --config (read config file and apply)
+    if(selected_option == 'c') {
+        char cfg_if[IF_NAMESIZE] = {};
+        ether_addr_t cfg_ether;
+
+        if (load_config(CONFIG_PATH, cfg_if, &cfg_ether) != 0) {
+            return 1;
+        }
+
+        // Retry loop for interface availability at boot time
+        interface_t iface;
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            interface_open(&iface, cfg_if);
+            if (iface) break;
+            fprintf(stderr, WARNING "Interface %s not found, retrying in %ds (%d/%d)...\n",
+                    cfg_if, RETRY_DELAY_SECONDS, attempt + 1, MAX_RETRIES);
+            sleep(RETRY_DELAY_SECONDS);
+        }
+
+        if (!iface) {
+            fprintf(stderr, ERROR "Interface %s not found after %d attempts\n", cfg_if, MAX_RETRIES);
+            return 1;
+        }
+
+        change_mac(iface, &cfg_ether);
+        return 0;
+    }
+
+    // Handle --install-daemon
+    if(selected_option == 'i') {
+        if (geteuid() != 0) {
+            fputs(ERROR "Please run --install-daemon as root\n", stderr);
+            return 1;
+        }
+        // Resolve binary path
+        char bin_path[PATH_MAX];
+        if (realpath(argv[0] ? argv[0] : "/proc/self/exe", bin_path) == NULL) {
+            // Fallback: use which
+            FILE* pipe = popen("which macchanger", "r");
+            if (pipe && fgets(bin_path, sizeof(bin_path), pipe)) {
+                bin_path[strcspn(bin_path, "\n")] = '\0';
+            }
+            if (pipe) pclose(pipe);
+        }
+        return install_daemon(bin_path);
+    }
+
+    // Handle --uninstall-daemon
+    if(selected_option == 'u') {
+        if (geteuid() != 0) {
+            fputs(ERROR "Please run --uninstall-daemon as root\n", stderr);
+            return 1;
+        }
+        return uninstall_daemon();
+    }
+
+    // Handle --save
+    if(selected_option == 'S') {
+        if(argc < 1) {
+            fputs(ERROR "Please specify an interface name\n", stderr);
+            return 1;
+        }
+        const char* if_name = argv[0];
+        if(strlen(if_name) > IFNAMSIZ) {
+            fputs(ERROR "Interface name too long\n", stderr);
+            return 1;
+        }
+
+        if (!mac_specified) {
+            // Read current MAC from interface
+            interface_t iface;
+            interface_open(&iface, if_name);
+            if(!iface) {
+                fprintf(stderr, ERROR "Can not find device %s\n", if_name);
+                return 1;
+            }
+            interface_get_ether(iface, &ether);
+        }
+
+        save_config(CONFIG_PATH, if_name, &ether);
+        return 0;
+    }
+
+    // Original options below
     if(argc < 1) {
         fputs(ERROR "Please specify an interface name\n", stderr);
         return 1;
@@ -139,11 +240,15 @@ int main(int argc, char** argv) {
 void print_usage() {
     puts("Usage: macchanger [option] [device]");
     puts("Options:");
-    puts(" -r, --random         Generates a random MAC and sets it");
-    puts(" -m, --mac MAC        Set a custom MAC address, e.g. macchanger -m aa:bb:cc:dd:ee:ff en0");
-    puts(" -p, --permanent      Resets the MAC address to the permanent");
-    puts(" -s, --show           Shows the current MAC address");
-    puts(" -v, --version        Prints version");
+    puts(" -r, --random           Generates a random MAC and sets it");
+    puts(" -m, --mac MAC          Set a custom MAC address, e.g. macchanger -m aa:bb:cc:dd:ee:ff en0");
+    puts(" -p, --permanent        Resets the MAC address to the permanent");
+    puts(" -s, --show             Shows the current MAC address");
+    puts(" -v, --version          Prints version");
+    puts(" -S, --save             Save current MAC to config file (combine with -m to save specific MAC)");
+    puts(" -c, --config           Apply MAC from config file (" CONFIG_PATH ")");
+    puts(" -i, --install-daemon   Install launchd daemon for auto-start at boot");
+    puts(" -u, --uninstall-daemon Remove launchd daemon");
 
 #ifdef HOMEPAGE
     puts("\nHomepage: " HOMEPAGE);
@@ -340,4 +445,126 @@ void interface_airport_disassociate(interface_t iface) {
     [interface disassociate];
 
     [client dealloc];
+}
+
+void save_config(const char* config_path, const char* if_name, const ether_addr_t* ether) {
+    FILE* f = fopen(config_path, "w");
+    if (!f) {
+        PERROR();
+        exit(errno);
+    }
+    fprintf(f, "# macchanger configuration\n");
+    fprintf(f, "# Generated by: sudo macchanger --save %s\n\n", if_name);
+    fprintf(f, "interface=%s\n", if_name);
+    fprintf(f, "mac=%s\n", ether_to_string(ether));
+    fclose(f);
+    chmod(config_path, 0600);
+    printf(INFO "Configuration saved to %s\n", config_path);
+}
+
+int load_config(const char* config_path, char* if_name, ether_addr_t* ether) {
+    FILE* f = fopen(config_path, "r");
+    if (!f) {
+        fprintf(stderr, ERROR "Config file not found: %s\n", config_path);
+        fprintf(stderr, "Run 'sudo macchanger --save <interface>' to create one.\n");
+        return -1;
+    }
+
+    int has_interface = 0, has_mac = 0;
+    char line[256];
+
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+
+        *eq = '\0';
+        char* key = line;
+        char* val = eq + 1;
+        val[strcspn(val, "\n")] = '\0';
+
+        if (strcmp(key, "interface") == 0) {
+            strncpy(if_name, val, IF_NAMESIZE);
+            has_interface = 1;
+        } else if (strcmp(key, "mac") == 0) {
+            if (ether_parse(val, ether) == 0) {
+                has_mac = 1;
+            }
+        }
+    }
+    fclose(f);
+
+    if (!has_interface) {
+        fprintf(stderr, ERROR "Config file missing 'interface' key\n");
+        return -1;
+    }
+    if (!has_mac) {
+        fprintf(stderr, ERROR "Config file missing or invalid 'mac' key\n");
+        return -1;
+    }
+    return 0;
+}
+
+int install_daemon(const char* bin_path) {
+    FILE* f = fopen(LAUNCHD_PLIST_PATH, "w");
+    if (!f) {
+        PERROR();
+        return errno;
+    }
+
+    fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    fprintf(f, "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\"\n");
+    fprintf(f, "  \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
+    fprintf(f, "<plist version=\"1.0\">\n");
+    fprintf(f, "<dict>\n");
+    fprintf(f, "    <key>Label</key>\n");
+    fprintf(f, "    <string>%s</string>\n\n", LAUNCHD_LABEL);
+    fprintf(f, "    <key>ProgramArguments</key>\n");
+    fprintf(f, "    <array>\n");
+    fprintf(f, "        <string>%s</string>\n", bin_path);
+    fprintf(f, "        <string>--config</string>\n");
+    fprintf(f, "    </array>\n\n");
+    fprintf(f, "    <key>RunAtLoad</key>\n");
+    fprintf(f, "    <true/>\n\n");
+    fprintf(f, "    <key>LaunchOnlyOnce</key>\n");
+    fprintf(f, "    <true/>\n\n");
+    fprintf(f, "    <key>StandardOutPath</key>\n");
+    fprintf(f, "    <string>/var/log/macchanger.log</string>\n\n");
+    fprintf(f, "    <key>StandardErrorPath</key>\n");
+    fprintf(f, "    <string>/var/log/macchanger.log</string>\n");
+    fprintf(f, "</dict>\n");
+    fprintf(f, "</plist>\n");
+    fclose(f);
+
+    printf(INFO "Daemon plist installed to %s\n", LAUNCHD_PLIST_PATH);
+
+    // Load the daemon
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "launchctl load %s", LAUNCHD_PLIST_PATH);
+    int res = system(cmd);
+    if (res == 0) {
+        printf(INFO "Daemon loaded successfully\n");
+    } else {
+        fprintf(stderr, WARNING "Failed to load daemon (exit code %d)\n", res);
+    }
+    return 0;
+}
+
+int uninstall_daemon(void) {
+    // Unload the daemon
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "launchctl unload %s", LAUNCHD_PLIST_PATH);
+    int res = system(cmd);
+    if (res == 0) {
+        printf(INFO "Daemon unloaded\n");
+    }
+
+    // Remove the plist file
+    if (unlink(LAUNCHD_PLIST_PATH) == 0) {
+        printf(INFO "Daemon plist removed from %s\n", LAUNCHD_PLIST_PATH);
+    } else {
+        fprintf(stderr, WARNING "Plist file not found: %s\n", LAUNCHD_PLIST_PATH);
+    }
+    return 0;
 }

@@ -1,6 +1,7 @@
 CC ?= clang
 CFLAGS := -framework IOKit -framework CoreWLAN -framework CoreFoundation -framework Cocoa -mmacosx-version-min=10.12
 prefix ?= /usr/local
+CONFIG_PATH ?= $(prefix)/etc/macchanger.conf
 
 VERSION="0.2.1"
 AUTHOR="Simon Hilchenbach"
@@ -12,7 +13,8 @@ macchanger: macchanger.m
 		-DVERSION='${VERSION}' \
 		-DAUTHOR='${AUTHOR}'   \
 		-DYEAR='${YEAR}'       \
-		-DHOMEPAGE='${HOMEPAGE}'
+		-DHOMEPAGE='${HOMEPAGE}' \
+		-DCONFIG_PATH='"${CONFIG_PATH}"'
 
 .PHONY: install
 install: macchanger
